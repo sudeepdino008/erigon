@@ -58,7 +58,7 @@ type ExecuteBlockCfg struct {
 	vmConfig      *vm.Config
 	tmpdir        string
 	stateStream   bool
-	accumulator   *shards.Accumulator
+	accumulator   *shards.Accumulator // Accumulator collects state changes in a form that can then be delivered to the RPC daemon
 	blockReader   interfaces.FullBlockReader
 }
 
@@ -102,6 +102,11 @@ func executeBlock(
 	contractHasTEVM func(contractHash commonold.Hash) (bool, error),
 	initialCycle bool,
 ) error {
+	// moskud:
+	// setup state reader/writer & call tracer (if contract has TEVM)
+	// ExecuteBlockEphemerally
+	// write the receipts, change set and traces (resulting from above)
+
 	blockNum := block.NumberU64()
 	stateReader, stateWriter, err := newStateReaderWriter(batch, tx, block, writeChangesets, cfg.accumulator, initialCycle, cfg.stateStream)
 	if err != nil {
