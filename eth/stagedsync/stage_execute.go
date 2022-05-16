@@ -92,8 +92,8 @@ func StageExecuteBlocksCfg(
 
 func executeBlock(
 	block *types.Block,
-	tx kv.RwTx,
-	batch ethdb.Database,
+	tx kv.RwTx, // transaction from RwDb; MDBX (chaindata)
+	batch ethdb.Database, // recording batches in-memory, which can then be committed to a backing kv.RwTx
 	cfg ExecuteBlockCfg,
 	vmConfig vm.Config, // emit copy, because will modify it
 	writeChangesets bool,
@@ -105,7 +105,7 @@ func executeBlock(
 	// moskud:
 	// setup state reader/writer & call tracer (if contract has TEVM)
 	// ExecuteBlockEphemerally
-	// write the receipts, change set and traces (resulting from above)
+	// write the receipts, change set (hook) and traces (resulting from above)
 
 	blockNum := block.NumberU64()
 	stateReader, stateWriter, err := newStateReaderWriter(batch, tx, block, writeChangesets, cfg.accumulator, initialCycle, cfg.stateStream)
@@ -172,8 +172,10 @@ func newStateReaderWriter(
 	var stateReader state.StateReader
 	var stateWriter state.WriterWithChangeSets
 
-	stateReader = state.NewPlainStateReader(batch)
+	stateReader = state.NewPlainStateReader(batch) //moskud: read account state (+ deference the "foreign keys" in account state like codehash/storage)
 
+	// moskud:
+	// seems to be putting in accumulator only, which is meant for data delivery in RPC (so useless from tools POV)
 	if !initialCycle && stateStream {
 		txs, err := rawdb.RawTransactionsRange(tx, block.NumberU64(), block.NumberU64())
 		if err != nil {

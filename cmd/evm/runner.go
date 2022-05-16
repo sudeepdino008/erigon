@@ -106,6 +106,9 @@ func timedExec(bench bool, execFunc func() ([]byte, uint64, error)) (output []by
 	return output, gasLeft, stats, err
 }
 
+
+// moskud
+// 
 func runCmd(ctx *cli.Context) error {
 	log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, log.StderrHandler))
 	//glogger := log.NewGlogHandler(log.StreamHandler(os.Stderr, log.TerminalFormat(false)))
@@ -123,7 +126,7 @@ func runCmd(ctx *cli.Context) error {
 		tracer        vm.Tracer
 		debugLogger   *vm.StructLogger
 		//moskud: caching and managing state changes across the block execution
-		// does block witness go here? - genesis info is written into the statedb
+		// does bspec.State go here? - genesis info is written into the statedb
 		statedb       *state.IntraBlockState  
 		chainConfig   *params.ChainConfig  
 		sender        = common.BytesToAddress([]byte("sender"))

@@ -222,21 +222,22 @@ func ExecuteBlockEphemerallyForBSC(
 func ExecuteBlockEphemerally(
 	chainConfig *params.ChainConfig,
 	vmConfig *vm.Config, // configuration options for the interpreter
-	getHeader func(hash common.Hash, number uint64) *types.Header,   // input: block header hash, block_height
+	getHeader func(hash common.Hash, number uint64) *types.Header, // input: block header hash, block_height
 	engine consensus.Engine,
-	block *types.Block,  // read from db
+	block *types.Block, // read from db
 	stateReader state.StateReader,
 	stateWriter state.WriterWithChangeSets,
 	epochReader consensus.EpochReader,
 	chainReader consensus.ChainHeaderReader,
-	contractHasTEVM func(codeHash common.Hash) (bool, error),   // transpiled evm (splitting evm codes into even lower level instructions)
+	contractHasTEVM func(codeHash common.Hash) (bool, error), // transpiled evm (splitting evm codes into even lower level instructions)
 ) (types.Receipts, *types.ReceiptForStorage, error) {
 	//moskud: reads block from stateReader, runs it and writes the result to stateWriter
 	// InitializeBlockExecution: pretty much a no-op (suppose to set the epoch etc.)
-	// DaoHardFork state changes
+	// DaoHardFork state changes (modifies the state database - refunds to certain accounts)
 	// For each transaction:
 	//    - apply the transaction
 	//    - write the traces (bool); append receipt (bool)
+	// validations
 	// create bloom filter (bool)
 	// finalize block execution (bool) - reward to miner + commit the in-memory changes resulting from the block
 	// some special handling for Bor consensus
