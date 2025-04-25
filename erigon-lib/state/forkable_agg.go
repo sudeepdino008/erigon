@@ -110,9 +110,6 @@ func (r *ForkableAgg) OpenFolder() error {
 }
 
 // BuildFiles builds all snapshots (asynchronously) upto a given RootNum
-// note that it doesn't check if data is available (in db, for retire)
-// till the given `num`, and it might build partially empty files if
-// data is not available in db.
 func (r *ForkableAgg) BuildFiles(num RootNum, unalignedIncluded bool) chan struct{} {
 	// build in background
 	fin := make(chan struct{})
@@ -152,6 +149,9 @@ func (r *ForkableAgg) BuildFiles(num RootNum, unalignedIncluded bool) chan struc
 }
 
 func (r *ForkableAgg) MergeLoop(ctx context.Context) error {
+	// multipe calls not allowed
+	// use snaps.MergeConfig...
+	// 
 	return nil
 }
 
@@ -243,12 +243,6 @@ func (r *ForkableAgg) buildFiles(ctx context.Context, to RootNum) (built bool, e
 	}
 
 	return len(cfiles) > 0, nil
-}
-
-func (r *ForkableAgg) cleanupDfs(dfs []*filesItem) {
-	for _, df := range dfs {
-		df.closeFiles()
-	}
 }
 
 func (r *ForkableAgg) Close() {
