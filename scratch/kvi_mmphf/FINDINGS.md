@@ -62,6 +62,42 @@ pushing commitment toward ~20 bits/key (**~2.5x**).
 - Halving the resident index (50.8 → ~26) directly addresses #21795's "kvi can't fit in memory"
   (4.46 GB → ~2.3 GB for the 0-8192 file), avoiding the 440–480µs cold path.
 
+## Cold/warm full-Get on real commitment files (15k random keys, vmtouch -e)
+
+| file | keys | baseline .kvi | new | size× | cold base→new | warm base→new |
+|---|---|---|---|---|---|---|
+| 9024-9056   | 18M  | 115 MB  | 66 MB  | 1.74× | 180→177 µs | 91→99 µs |
+| 187416-187418 | 34M | 213 MB | 121 MB | 1.76× | 208→205 µs | 83→93 µs |
+| 8704-8960   | 73M  | 464 MB  | 264 MB | 1.76× | 289→273 µs | 96→104 µs |
+| 0-102400 (v1) | 228M | 1454 MB | 791 MB | 1.84× | —/372 µs | — |
+
+A/B vs enums=true (14.5 GB file): baseline 213 MB → enums=true 187 MB (1.14×) → new 121 MB
+(1.76×). The learned model contributes 187→121 MB (1.55×) — most of the win. enums=true alone
+barely helps because the permuted full-rank array is nearly as big as the raw-offset array.
+
+Conclusion: MMPHF+EF is a memory-footprint win (1.74–1.84×, grows with scale) with comparable
+cold/warm latency. Cold full-Get is dominated by the shared .kv value-page fault, so a smaller
+index doesn't speed the per-lookup cold path — its value is residency (smaller → stays warm →
+~90 µs path). Harness reproduces #21795's 14.5 GB row (213 MB / 203 µs). Bench tool: scratch/kvi_coldbench/.
+
+## Recursive prefix-stripping model (solves the deep-prefix blowup)
+
+scratch/kvi_mmphf_rec/. Each node uses an EXACT uint64 coordinate = the 8 key bytes after
+that node's longest-common-prefix (LCP), so float precision lands on the first differing byte.
+Keys that still tie on those 8 bytes recurse one level deeper. Critically, a recursed group
+forces a SEGMENT BREAK in the parent so the parent never interpolates across the rank-gap the
+group leaves behind (that gap was the −1.29M residual outlier in the flat model).
+
+| file | keys | residual | recursion depth | bit-packed bits/key | vs baseline 50.8 |
+|---|---|---|---|---|---|
+| commitment 9024-9056 | 18M | 8 bits | 1 | 20.8 | 2.44× |
+| commitment 8704-8960 | 73M | 9 bits | 1 | ~21.4 | 2.37× |
+| accounts (uniform) | 2.6M | 7 bits | 0 (none) | 17.4 | — |
+
+100% correct. Uniform keys need no recursion (depth 0) and are unaffected. Recursive model
+improves commitment from the flat model's 1.94× to ~2.4× — meeting the projected ~2.5–3× range.
+(recsplit byte-rounds 9-bit residuals to 2 bytes; production bit-packing gives the ideal column.)
+
 ## Next steps for integration
 - Bit-packed residual store (not recsplit's byte-rounded bytesPerRec) — saves the rounding waste.
 - Recursive model for deep-prefix buckets.
