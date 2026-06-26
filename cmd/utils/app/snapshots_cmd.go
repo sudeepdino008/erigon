@@ -28,6 +28,7 @@ import (
 	"math"
 	"os"
 	"runtime/pprof"
+	"syscall"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -3672,13 +3673,22 @@ func doBuildStateFilesCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 		defer pprof.StopCPUProfile()
 	}
 
+	cpu := func() float64 {
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			return 0
+		}
+		return time.Duration(ru.Utime.Nano() + ru.Stime.Nano()).Seconds()
+	}
+
 	started := time.Now()
+	cpu0 := cpu()
 	logger.Info("[bench] BuildFiles start", "lastTxNum", lastTxNum, "stepSize", agg.StepSize())
 	if err = agg.BuildFiles(lastTxNum); err != nil {
 		return err
 	}
 	agg.WaitForFiles()
-	logger.Info("[bench] BuildFiles done", "took", time.Since(started))
+	logger.Info("[bench] BuildFiles done", "took", time.Since(started), "cpu_secs", fmt.Sprintf("%.2f", cpu()-cpu0))
 	return nil
 }
 
