@@ -3638,6 +3638,9 @@ func doBuildStateFilesCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	blockSnapBuildSema := semaphore.NewWeighted(int64(runtime.NumCPU()))
 	agg.SetSnapshotBuildSema(blockSnapBuildSema)
 	agg.PresetOfflineMerge()
+	if os.Getenv("BENCH_SERIAL_COLLATE") == "1" {
+		agg.SetCollateParallel(false)
+	}
 	agg.PeriodicalyPrintProcessSet(ctx)
 
 	blockReader, _ := br.IO()

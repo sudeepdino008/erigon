@@ -116,6 +116,11 @@ type Aggregator struct {
 
 	produce bool
 
+	// collateParallel collates domains/IIs concurrently (each on its own read-tx).
+	// Safe only without a concurrent writer committing between tx opens, so it's set
+	// only by the PresetOffline* helpers; live exec keeps the single-tx path (#20169).
+	collateParallel bool
+
 	checker *DependencyIntegrityChecker
 
 	// Domain configuration state: ConfigureDomains() is a no-op once configured is true.
@@ -657,6 +662,7 @@ func (a *Aggregator) PresetOfflineMerge() {
 		a.setBuildAccessorsWorkers(estimate.IndexSnapshot.Workers())
 	}
 	a.workers.setMerge(dbg.MergeWorkers) // compression and accessors: support parallel-building means we don't need multiple `merge_workers` usually
+	a.collateParallel = true
 }
 
 // PresetOfflineExecution configures workers for offline execution (e.g. integration tool):
@@ -877,16 +883,9 @@ func (a *Aggregator) buildFiles(ctx context.Context, step kv.Step) error {
 	ac := a.BeginFilesRo()
 	defer ac.Close()
 
-	// Phase 1: collate all domains and indices using a SINGLE read-transaction.
-	// This guarantees all collations see the exact same MDBX snapshot, eliminating
-	// the collation/pruning race where execution overwrites step S values with
-	// step S+1 data between collation reads. See #20169.
-	collationTx, err := a.db.BeginRo(ctx)
-	if err != nil {
-		return fmt.Errorf("open collation tx: %w", err)
-	}
-	defer collationTx.Rollback()
-
+	// Phase 1: collate all domains and indices. Serial path uses one read-tx so all
+	// collations see the same MDBX snapshot (collation/pruning race, #20169); the
+	// offline parallel path below uses a read-tx per collation instead.
 	type domainCollResult struct {
 		d         *Domain
 		collation Collation
@@ -907,36 +906,107 @@ func (a *Aggregator) buildFiles(ctx context.Context, step kv.Step) error {
 		}
 	}()
 
+	type domWork struct {
+		d *Domain
+	}
+	var domWorks []domWork
 	for id, d := range a.d {
 		if d.Disable {
 			continue
 		}
-		firstStepNotInFiles := ac.d[id].FirstStepNotInFiles()
-		if step < firstStepNotInFiles {
+		if step < ac.d[id].FirstStepNotInFiles() {
 			continue
 		}
-		collation, err := d.collate(ctx, step, txFrom, txTo, collationTx)
-		if err != nil {
-			return fmt.Errorf("domain collation %q has failed: %w", d.FilenameBase, err)
-		}
-		collations = append(collations, collation)
-		domainColls = append(domainColls, domainCollResult{d: d, collation: collation})
+		domWorks = append(domWorks, domWork{d: d})
 	}
+	type iiWork struct {
+		iikey int
+		ii    *InvertedIndex
+	}
+	var iiWorks []iiWork
 	for iikey, ii := range a.standaloneIIs() {
 		if ii.Disable {
 			continue
 		}
-		firstStepNotInFiles := ac.iis[iikey].FirstStepNotInFiles()
-		if step < firstStepNotInFiles {
+		if step < ac.iis[iikey].FirstStepNotInFiles() {
 			continue
 		}
-		collation, err := ii.collate(ctx, step, collationTx)
-		if err != nil {
-			return fmt.Errorf("index collation %q has failed: %w", ii.FilenameBase, err)
-		}
-		iiColls = append(iiColls, iiCollResult{ii: ii, iikey: iikey, collation: collation})
+		iiWorks = append(iiWorks, iiWork{iikey: iikey, ii: ii})
 	}
-	collationTx.Rollback() // release the read-tx before Phase 2 (no DB access needed)
+
+	if a.collateParallel {
+		// Plain errgroup (not WithContext): a collation's compressor captures the
+		// ctx and is used later in Phase 2, so the ctx must not be canceled when
+		// Wait returns.
+		var mu sync.Mutex
+		var cg errgroup.Group
+		cg.SetLimit(a.workers.getCollateAndBuild())
+		for _, w := range domWorks {
+			w := w
+			cg.Go(func() error {
+				tx, err := a.db.BeginRo(ctx)
+				if err != nil {
+					return err
+				}
+				defer tx.Rollback()
+				coll, err := w.d.collate(ctx, step, txFrom, txTo, tx)
+				if err != nil {
+					return fmt.Errorf("domain collation %q has failed: %w", w.d.FilenameBase, err)
+				}
+				mu.Lock()
+				collations = append(collations, coll)
+				domainColls = append(domainColls, domainCollResult{d: w.d, collation: coll})
+				mu.Unlock()
+				return nil
+			})
+		}
+		for _, w := range iiWorks {
+			w := w
+			cg.Go(func() error {
+				tx, err := a.db.BeginRo(ctx)
+				if err != nil {
+					return err
+				}
+				defer tx.Rollback()
+				coll, err := w.ii.collate(ctx, step, tx)
+				if err != nil {
+					return fmt.Errorf("index collation %q has failed: %w", w.ii.FilenameBase, err)
+				}
+				mu.Lock()
+				iiColls = append(iiColls, iiCollResult{ii: w.ii, iikey: w.iikey, collation: coll})
+				mu.Unlock()
+				return nil
+			})
+		}
+		if err := cg.Wait(); err != nil {
+			return err
+		}
+	} else {
+		// Single read-transaction so all collations see the exact same MDBX
+		// snapshot, eliminating the collation/pruning race where execution
+		// overwrites step S values with step S+1 data between reads (#20169).
+		collationTx, err := a.db.BeginRo(ctx)
+		if err != nil {
+			return fmt.Errorf("open collation tx: %w", err)
+		}
+		defer collationTx.Rollback()
+		for _, w := range domWorks {
+			coll, err := w.d.collate(ctx, step, txFrom, txTo, collationTx)
+			if err != nil {
+				return fmt.Errorf("domain collation %q has failed: %w", w.d.FilenameBase, err)
+			}
+			collations = append(collations, coll)
+			domainColls = append(domainColls, domainCollResult{d: w.d, collation: coll})
+		}
+		for _, w := range iiWorks {
+			coll, err := w.ii.collate(ctx, step, collationTx)
+			if err != nil {
+				return fmt.Errorf("index collation %q has failed: %w", w.ii.FilenameBase, err)
+			}
+			iiColls = append(iiColls, iiCollResult{ii: w.ii, iikey: w.iikey, collation: coll})
+		}
+		collationTx.Rollback() // release the read-tx before Phase 2 (no DB access needed)
+	}
 	closeCollations = false
 	buildAt := time.Now()
 
@@ -2026,6 +2096,11 @@ func (a *Aggregator) SetSnapshotBuildSema(semaphore *semaphore.Weighted) {
 // SetProduceMod allows setting produce to false in order to stop making state files (default value is true)
 func (a *Aggregator) SetProduceMod(produce bool) {
 	a.produce = produce
+}
+
+// SetCollateParallel toggles concurrent per-domain collation. Only safe offline.
+func (a *Aggregator) SetCollateParallel(v bool) {
+	a.collateParallel = v
 }
 
 func (a *Aggregator) BuildFilesInBackground(txNum uint64) chan struct{} {
