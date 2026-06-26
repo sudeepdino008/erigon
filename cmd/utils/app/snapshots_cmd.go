@@ -193,6 +193,22 @@ var snapshotCommand = cli.Command{
 			}),
 		},
 		{
+			Name: "build-state",
+			Action: func(c *cli.Context) error {
+				dirs, l, err := datadir.New(c.String(utils.DataDirFlag.Name)).MustFlock()
+				if err != nil {
+					return err
+				}
+				defer l.Unlock()
+
+				return doBuildStateFilesCommand(c, dirs)
+			},
+			Usage: "benchmark-only: collate accumulated DB steps into state files (no block-retire, no prune); re-runnable",
+			Flags: joinFlags([]cli.Flag{
+				&utils.DataDirFlag,
+			}),
+		},
+		{
 			Name: "unmerge",
 			Action: func(c *cli.Context) error {
 				dirs, l, err := datadir.New(c.String(utils.DataDirFlag.Name)).MustFlock()
@@ -3590,6 +3606,63 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 		return err
 	}
 
+	return nil
+}
+
+// doBuildStateFilesCommand isolates state collation + index building for benchmarking.
+// It collates the un-collated DB steps into state files via agg.BuildFiles and exits —
+// no block retire, no pruning, no merge. Because collation reads the DB through a
+// read-only tx and only writes new step files, this is non-destructive and re-runnable:
+// delete the produced step files and run again to repeat the identical workload.
+func doBuildStateFilesCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
+	logger := log.Root()
+	defer logger.Info("Done")
+	ctx := cliCtx.Context
+
+	dbg.SetNoMerge(true) // isolate collation+indexing from merge
+
+	db := dbCfg(dbcfg.ChainDB, dirs.Chaindata).MustOpen()
+	defer db.Close()
+	chainConfig := fromdb.ChainConfig(db)
+	cfg := ethconfig.NewSnapCfg(false, true, true, chainConfig.ChainName)
+
+	res, clean, err := openSnaps(ctx, cfg, dirs, db, logger)
+	if err != nil {
+		return err
+	}
+	br, agg := res.BlockRetire, res.Aggregator
+	defer clean()
+	defer agg.MadvNormal().DisableReadAhead()
+
+	blockSnapBuildSema := semaphore.NewWeighted(int64(runtime.NumCPU()))
+	agg.SetSnapshotBuildSema(blockSnapBuildSema)
+	agg.PresetOfflineMerge()
+	agg.PeriodicalyPrintProcessSet(ctx)
+
+	blockReader, _ := br.IO()
+
+	tdb, err := temporal.New(db, agg)
+	if err != nil {
+		return err
+	}
+
+	txNumsReader := blockReader.TxnumReader()
+	var lastTxNum uint64
+	if err := tdb.Update(ctx, func(tx kv.RwTx) error {
+		execProgress, _ := stages.GetStageProgress(tx, stages.Execution)
+		lastTxNum, err = txNumsReader.Max(ctx, tx, execProgress)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	started := time.Now()
+	logger.Info("[bench] BuildFiles start", "lastTxNum", lastTxNum, "stepSize", agg.StepSize())
+	if err = agg.BuildFiles(lastTxNum); err != nil {
+		return err
+	}
+	agg.WaitForFiles()
+	logger.Info("[bench] BuildFiles done", "took", time.Since(started))
 	return nil
 }
 
