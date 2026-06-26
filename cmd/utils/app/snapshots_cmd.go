@@ -27,6 +27,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"runtime/pprof"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -3654,6 +3655,18 @@ func doBuildStateFilesCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 		return err
 	}); err != nil {
 		return err
+	}
+
+	if pp := os.Getenv("BENCH_CPUPROFILE"); pp != "" {
+		f, ferr := os.Create(pp)
+		if ferr != nil {
+			return ferr
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return err
+		}
+		defer pprof.StopCPUProfile()
 	}
 
 	started := time.Now()
