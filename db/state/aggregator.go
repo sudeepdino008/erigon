@@ -944,12 +944,17 @@ func (a *Aggregator) buildFiles(ctx context.Context, step kv.Step) error {
 		for _, w := range domWorks {
 			w := w
 			cg.Go(func() error {
-				tx, err := a.db.BeginRo(ctx)
-				if err != nil {
-					return err
+				var coll Collation
+				var err error
+				if w.d.ParallelCollate {
+					coll, err = w.d.collateParallel(ctx, step, txFrom, txTo, a.db, parallelCollateShards)
+				} else {
+					var tx kv.Tx
+					if tx, err = a.db.BeginRo(ctx); err == nil {
+						defer tx.Rollback()
+						coll, err = w.d.collate(ctx, step, txFrom, txTo, tx)
+					}
 				}
-				defer tx.Rollback()
-				coll, err := w.d.collate(ctx, step, txFrom, txTo, tx)
 				if err != nil {
 					return fmt.Errorf("domain collation %q has failed: %w", w.d.FilenameBase, err)
 				}

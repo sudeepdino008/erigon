@@ -875,6 +875,170 @@ func (d *Domain) collate(ctx context.Context, step kv.Step, txFrom, txTo uint64,
 	return coll, nil
 }
 
+const parallelCollateShards = 8
+
+// collateParallel produces the same Collation as collate but splits the dupsort
+// values scan into key-range shards collated concurrently (each on its own
+// read-tx), then concatenates the per-shard word files in key order. Output is
+// identical to collate because shards cover contiguous, sorted key ranges. Only
+// safe offline (multiple read-tx must see the same snapshot, #20169).
+func (d *Domain) collateParallel(ctx context.Context, step kv.Step, txFrom, txTo uint64, db kv.RoDB, nShards int) (coll Collation, err error) {
+	if d.LargeValues || nShards <= 1 {
+		tx, err := db.BeginRo(ctx)
+		if err != nil {
+			return Collation{}, err
+		}
+		defer tx.Rollback()
+		return d.collate(ctx, step, txFrom, txTo, tx)
+	}
+
+	{
+		htx, herr := db.BeginRo(ctx)
+		if herr != nil {
+			return Collation{}, herr
+		}
+		coll.HistoryCollation, err = d.History.collate(ctx, step, txFrom, txTo, htx)
+		htx.Rollback()
+		if err != nil {
+			return Collation{}, err
+		}
+	}
+	closeCollation := true
+	defer func() {
+		if closeCollation {
+			coll.Close()
+		}
+	}()
+
+	coll.valuesPath = d.kvNewFilePath(step, step+1)
+	if coll.valuesComp, err = seg.NewCompressor(ctx, d.FilenameBase+".domain.collate", coll.valuesPath, d.dirs.Tmp, d.CompressCfg, log.LvlTrace, d.logger); err != nil {
+		return Collation{}, fmt.Errorf("create %s values compressor: %w", d.FilenameBase, err)
+	}
+
+	splits, err := d.collateSplitKeys(ctx, db, nShards)
+	if err != nil {
+		return Collation{}, err
+	}
+	nShards = len(splits) + 1
+
+	stepVal := ^uint64(step)
+	shards := make([]*seg.RawWordsFile, nShards)
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(nShards)
+	for i := 0; i < nShards; i++ {
+		i := i
+		var start, end []byte
+		if i > 0 {
+			start = splits[i-1]
+		}
+		if i < nShards-1 {
+			end = splits[i]
+		}
+		g.Go(func() error {
+			tx, err := db.BeginRo(gctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			cur, err := tx.CursorDupSort(d.ValuesTable)
+			if err != nil {
+				return err
+			}
+			defer cur.Close()
+			sf, err := seg.NewRawWordsFile(fmt.Sprintf("%s.shard%d", coll.valuesPath, i))
+			if err != nil {
+				return err
+			}
+			shards[i] = sf
+
+			var k, v []byte
+			if start == nil {
+				k, v, err = cur.First()
+			} else {
+				k, v, err = cur.Seek(start)
+			}
+			for k != nil {
+				if err != nil {
+					return err
+				}
+				if end != nil && bytes.Compare(k, end) >= 0 {
+					break
+				}
+				if binary.BigEndian.Uint64(v[:8]) != stepVal {
+					k, v, err = cur.Next()
+					continue
+				}
+				if err = sf.AppendUncompressed(k); err != nil {
+					return err
+				}
+				if err = sf.AppendUncompressed(v[8:]); err != nil {
+					return err
+				}
+				k, v, err = cur.NextNoDup()
+			}
+			return sf.Flush()
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return Collation{}, err
+	}
+
+	comp := seg.NewWriter(coll.valuesComp, seg.CompressNone)
+	for i := 0; i < nShards; i++ {
+		sf := shards[i]
+		if sf == nil {
+			continue
+		}
+		if err := sf.ForEach(func(word []byte, _ bool) error { _, e := comp.Write(word); return e }); err != nil {
+			return Collation{}, err
+		}
+		sf.CloseAndRemove()
+		shards[i] = nil
+	}
+
+	coll.valuesCount = coll.valuesComp.Count() / 2
+	mxCollationSize.SetUint64(uint64(coll.valuesCount))
+	closeCollation = false
+	return coll, nil
+}
+
+// collateSplitKeys returns nShards-1 boundary keys partitioning d.ValuesTable
+// into equal unique-key-count ranges.
+//
+// PROTOTYPE: this pre-scans the table (reads values via NextNoDup), so it doubles
+// the read cost — fine for validating byte-identical output, not for timing. The
+// production path is mdbx_estimate_range (no scan), which needs mdbx-go >= v0.40.2.
+func (d *Domain) collateSplitKeys(ctx context.Context, db kv.RoDB, nShards int) ([][]byte, error) {
+	if nShards <= 1 {
+		return nil, nil
+	}
+	tx, err := db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	cur, err := tx.CursorDupSort(d.ValuesTable)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close()
+	var keys [][]byte
+	for k, _, e := cur.First(); k != nil; k, _, e = cur.NextNoDup() {
+		if e != nil {
+			return nil, e
+		}
+		keys = append(keys, append([]byte(nil), k...))
+	}
+	if len(keys) < nShards {
+		return nil, nil
+	}
+	splits := make([][]byte, 0, nShards-1)
+	for i := 1; i < nShards; i++ {
+		splits = append(splits, keys[i*len(keys)/nShards])
+	}
+	return splits, nil
+}
+
 type StaticFiles struct {
 	HistoryFiles
 	valuesDecomp    *seg.Decompressor
