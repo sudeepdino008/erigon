@@ -1118,7 +1118,7 @@ func (d *Domain) buildHashMapAccessorAt(ctx context.Context, idxPath string, dat
 		LessFalsePositives: true,
 
 		BucketSize: recsplit.DefaultBucketSize,
-		LeafSize:   recsplit.DefaultLeafSize,
+		LeafSize:   5,
 		TmpDir:     d.dirs.Tmp,
 		IndexFile:  idxPath,
 		Salt:       d.salt.Load(),
