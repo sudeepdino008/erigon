@@ -24,6 +24,11 @@ type DomainCfg struct {
 
 	BuildAccessorsWorkers int // parallel workers for building .kvi accessors (recsplit)
 
+	// ParallelCollate marks a domain eligible for splitting its values collation
+	// across key-range shards (each on its own read-tx). Only activated in offline
+	// builds; set for large domains like commitment where collation dominates.
+	ParallelCollate bool
+
 	FileVersion DomainVersionTypes
 }
 

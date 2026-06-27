@@ -29,10 +29,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	g "github.com/anacrolix/generics"
@@ -190,6 +192,22 @@ var snapshotCommand = cli.Command{
 			Flags: joinFlags([]cli.Flag{
 				&utils.DataDirFlag,
 				&utils.ErigondbDomainStepsInFrozenFileFlag,
+			}),
+		},
+		{
+			Name: "build-state",
+			Action: func(c *cli.Context) error {
+				dirs, l, err := datadir.New(c.String(utils.DataDirFlag.Name)).MustFlock()
+				if err != nil {
+					return err
+				}
+				defer l.Unlock()
+
+				return doBuildStateFilesCommand(c, dirs)
+			},
+			Usage: "benchmark-only: collate accumulated DB steps into state files (no block-retire, no prune); re-runnable",
+			Flags: joinFlags([]cli.Flag{
+				&utils.DataDirFlag,
 			}),
 		},
 		{
@@ -3590,6 +3608,87 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 		return err
 	}
 
+	return nil
+}
+
+// doBuildStateFilesCommand isolates state collation + index building for benchmarking.
+// It collates the un-collated DB steps into state files via agg.BuildFiles and exits —
+// no block retire, no pruning, no merge. Because collation reads the DB through a
+// read-only tx and only writes new step files, this is non-destructive and re-runnable:
+// delete the produced step files and run again to repeat the identical workload.
+func doBuildStateFilesCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
+	logger := log.Root()
+	defer logger.Info("Done")
+	ctx := cliCtx.Context
+
+	dbg.SetNoMerge(true) // isolate collation+indexing from merge
+
+	db := dbCfg(dbcfg.ChainDB, dirs.Chaindata).MustOpen()
+	defer db.Close()
+	chainConfig := fromdb.ChainConfig(db)
+	cfg := ethconfig.NewSnapCfg(false, true, true, chainConfig.ChainName)
+
+	res, clean, err := openSnaps(ctx, cfg, dirs, db, logger)
+	if err != nil {
+		return err
+	}
+	br, agg := res.BlockRetire, res.Aggregator
+	defer clean()
+	defer agg.MadvNormal().DisableReadAhead()
+
+	blockSnapBuildSema := semaphore.NewWeighted(int64(runtime.NumCPU()))
+	agg.SetSnapshotBuildSema(blockSnapBuildSema)
+	agg.PresetOfflineMerge()
+	if os.Getenv("BENCH_SERIAL_COLLATE") == "1" {
+		agg.SetCollateParallel(false)
+	}
+	agg.PeriodicalyPrintProcessSet(ctx)
+
+	blockReader, _ := br.IO()
+
+	tdb, err := temporal.New(db, agg)
+	if err != nil {
+		return err
+	}
+
+	txNumsReader := blockReader.TxnumReader()
+	var lastTxNum uint64
+	if err := tdb.Update(ctx, func(tx kv.RwTx) error {
+		execProgress, _ := stages.GetStageProgress(tx, stages.Execution)
+		lastTxNum, err = txNumsReader.Max(ctx, tx, execProgress)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	if pp := os.Getenv("BENCH_CPUPROFILE"); pp != "" {
+		f, ferr := os.Create(pp)
+		if ferr != nil {
+			return ferr
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return err
+		}
+		defer pprof.StopCPUProfile()
+	}
+
+	cpu := func() float64 {
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			return 0
+		}
+		return time.Duration(ru.Utime.Nano() + ru.Stime.Nano()).Seconds()
+	}
+
+	started := time.Now()
+	cpu0 := cpu()
+	logger.Info("[bench] BuildFiles start", "lastTxNum", lastTxNum, "stepSize", agg.StepSize())
+	if err = agg.BuildFiles(lastTxNum); err != nil {
+		return err
+	}
+	agg.WaitForFiles()
+	logger.Info("[bench] BuildFiles done", "took", time.Since(started), "cpu_secs", fmt.Sprintf("%.2f", cpu()-cpu0))
 	return nil
 }
 

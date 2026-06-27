@@ -813,6 +813,19 @@ func (tx *MdbxTx) Count(bucket string) (uint64, error) {
 	return st.Entries, nil
 }
 
+// EstimateRange estimates the number of entries with key in [beginKey, endKey)
+// without scanning (mdbx_estimate_range). nil bounds mean open-ended.
+func (tx *MdbxTx) EstimateRange(bucket string, beginKey, endKey []byte) (uint64, error) {
+	n, err := tx.tx.EstimateRange(mdbx.DBI(tx.db.buckets[bucket].DBI), beginKey, nil, endKey, nil)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		n = 0
+	}
+	return uint64(n), nil
+}
+
 func (tx *MdbxTx) CollectMetrics() {
 	if !tx.db.opts.metrics {
 		return
