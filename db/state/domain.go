@@ -892,16 +892,11 @@ func (d *Domain) collateParallel(ctx context.Context, step kv.Step, txFrom, txTo
 		return d.collate(ctx, step, txFrom, txTo, tx)
 	}
 
-	{
-		htx, herr := db.BeginRo(ctx)
-		if herr != nil {
-			return Collation{}, herr
-		}
-		coll.HistoryCollation, err = d.History.collate(ctx, step, txFrom, txTo, htx)
-		htx.Rollback()
-		if err != nil {
-			return Collation{}, err
-		}
+	if err = db.View(ctx, func(htx kv.Tx) (herr error) {
+		coll.HistoryCollation, herr = d.History.collate(ctx, step, txFrom, txTo, htx)
+		return herr
+	}); err != nil {
+		return Collation{}, err
 	}
 	closeCollation := true
 	defer func() {
