@@ -1002,39 +1002,52 @@ func (d *Domain) collateParallel(ctx context.Context, step kv.Step, txFrom, txTo
 	return coll, nil
 }
 
-// collateSplitKeys returns nShards-1 boundary keys partitioning d.ValuesTable
-// into equal unique-key-count ranges.
-//
-// PROTOTYPE: this pre-scans the table (reads values via NextNoDup), so it doubles
-// the read cost — fine for validating byte-identical output, not for timing. The
-// production path is mdbx_estimate_range (no scan), which needs mdbx-go >= v0.40.2.
+// collateSplitKeys returns up to nShards-1 boundary keys (8-byte big-endian
+// prefixes) partitioning d.ValuesTable into roughly equal entry-count ranges,
+// using mdbx range estimation — no table scan. Falls back to a single shard if
+// the tx doesn't support estimation.
 func (d *Domain) collateSplitKeys(ctx context.Context, db kv.RoDB, nShards int) ([][]byte, error) {
 	if nShards <= 1 {
 		return nil, nil
+	}
+	type rangeEstimator interface {
+		Count(bucket string) (uint64, error)
+		EstimateRange(bucket string, beginKey, endKey []byte) (uint64, error)
 	}
 	tx, err := db.BeginRo(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	cur, err := tx.CursorDupSort(d.ValuesTable)
-	if err != nil {
-		return nil, err
-	}
-	defer cur.Close()
-	var keys [][]byte
-	for k, _, e := cur.First(); k != nil; k, _, e = cur.NextNoDup() {
-		if e != nil {
-			return nil, e
-		}
-		keys = append(keys, append([]byte(nil), k...))
-	}
-	if len(keys) < nShards {
+	est, ok := tx.(rangeEstimator)
+	if !ok {
 		return nil, nil
+	}
+	total, err := est.Count(d.ValuesTable)
+	if err != nil || total == 0 {
+		return nil, err
 	}
 	splits := make([][]byte, 0, nShards-1)
 	for i := 1; i < nShards; i++ {
-		splits = append(splits, keys[i*len(keys)/nShards])
+		target := uint64(i) * total / uint64(nShards)
+		var lo, hi uint64 = 0, ^uint64(0)
+		for lo < hi { // binary-search the 8-byte prefix whose entry-rank ~= target
+			mid := lo + (hi-lo)/2
+			p := binary.BigEndian.AppendUint64(nil, mid)
+			c, eerr := est.EstimateRange(d.ValuesTable, nil, p)
+			if eerr != nil {
+				return nil, eerr
+			}
+			if c < target {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		p := binary.BigEndian.AppendUint64(nil, lo)
+		if len(splits) == 0 || bytes.Compare(p, splits[len(splits)-1]) > 0 {
+			splits = append(splits, p)
+		}
 	}
 	return splits, nil
 }
