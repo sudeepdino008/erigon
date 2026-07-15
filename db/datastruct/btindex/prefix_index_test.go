@@ -520,7 +520,7 @@ func TestPrefixIndexNarrowWithNodes(t *testing.T) {
 		if l == 0 && r == 0 {
 			continue
 		}
-		nl, nr, exactDI, found := pi.narrowWithNodes(keys[i], l, r)
+		nl, nr, exactDI, found, _, _ := pi.narrowWithNodes(keys[i], l, r)
 		if found {
 			// Verify the exact DI matches a cached node.
 			prefix := uint16(keys[i][0])<<8 | uint16(keys[i][1])

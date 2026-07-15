@@ -28,13 +28,26 @@ func majflt() int64 {
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
 	return ru.Majflt
 }
-func fsize(p string) int64 { fi, e := os.Stat(p); if e != nil { return 0 }; return fi.Size() }
-func evict(f ...string)    { _ = exec.Command("vmtouch", append([]string{"-e"}, f...)...).Run() }
-func load(f ...string)     { _ = exec.Command("vmtouch", append([]string{"-t"}, f...)...).Run() }
-func must(e error)         { if e != nil { panic(e) } }
+func fsize(p string) int64 {
+	fi, e := os.Stat(p)
+	if e != nil {
+		return 0
+	}
+	return fi.Size()
+}
+func evict(f ...string) { _ = exec.Command("vmtouch", append([]string{"-e"}, f...)...).Run() }
+func load(f ...string)  { _ = exec.Command("vmtouch", append([]string{"-t"}, f...)...).Run() }
+func must(e error) {
+	if e != nil {
+		panic(e)
+	}
+}
 
 func method() string {
 	if dbg.UsePrefixIndex {
+		if btindex.BtInterp {
+			return "prefix+interp"
+		}
 		return "prefix"
 	}
 	if btindex.BtInterp {
@@ -51,6 +64,7 @@ func main() {
 	logger := log.New()
 	M := btindex.DefaultBtreeM
 	base := filepath.Base(*kvPath)
+	fmt.Printf("DBG BtInterp=%v UsePrefix=%v | env BT_INTERP=%q ERIGON_BT_INTERP=%q ERIGON_USE_PREFIX_INDEX=%q\n", btindex.BtInterp, dbg.UsePrefixIndex, os.Getenv("BT_INTERP"), os.Getenv("ERIGON_BT_INTERP"), os.Getenv("ERIGON_USE_PREFIX_INDEX"))
 	btPath := filepath.Join(*out, fmt.Sprintf("%s.M%d.bt", base, M))
 	kveiPath := strings.TrimSuffix(btPath, ".bt") + ".kvei"
 

@@ -118,14 +118,14 @@ func (p *PrefixIndex) lookup(key []byte) (l, r uint64) {
 
 // narrowWithNodes refines the [l, r) range using cached nodes in the key's prefix bucket.
 // If an exact match is found among nodes, returns found=true and exactDI.
-func (p *PrefixIndex) narrowWithNodes(key []byte, l, r uint64) (nl, nr, exactDI uint64, found bool) {
+func (p *PrefixIndex) narrowWithNodes(key []byte, l, r uint64) (nl, nr, exactDI uint64, found bool, klo, khi []byte) {
 	if len(key) < 2 {
-		return l, r, 0, false
+		return l, r, 0, false, nil, nil
 	}
 	prefix := uint16(key[0])<<8 | uint16(key[1])
 	bucket := &p.buckets[prefix]
 	if len(bucket.nodes) == 0 {
-		return l, r, 0, false
+		return l, r, 0, false, nil, nil
 	}
 
 	// binary search over cached nodes
@@ -134,7 +134,7 @@ func (p *PrefixIndex) narrowWithNodes(key []byte, l, r uint64) (nl, nr, exactDI 
 		mid := (lo + hi) >> 1
 		cmp := bytes.Compare(bucket.nodes[mid].key, key)
 		if cmp == 0 {
-			return 0, 0, bucket.nodes[mid].di, true
+			return 0, 0, bucket.nodes[mid].di, true, nil, nil
 		} else if cmp < 0 {
 			lo = mid + 1
 		} else {
@@ -147,14 +147,16 @@ func (p *PrefixIndex) narrowWithNodes(key []byte, l, r uint64) (nl, nr, exactDI 
 		if newL := bucket.nodes[lo-1].di + 1; newL > l {
 			l = newL
 		}
+		klo = bucket.nodes[lo-1].key
 	}
 	if lo < len(bucket.nodes) {
 		if newR := bucket.nodes[lo].di; newR < r {
 			r = newR
 		}
+		khi = bucket.nodes[lo].key
 	}
 
-	return l, r, 0, false
+	return l, r, 0, false, klo, khi
 }
 
 // addNode adds a pre-built node to the appropriate prefix bucket.
@@ -380,7 +382,7 @@ func (p *PrefixIndex) Seek(g *seg.Reader, seekKey []byte) (*Cursor, error) {
 	}
 
 	// narrow with cached nodes
-	nl, nr, exactDI, found := p.narrowWithNodes(seekKey, l, r)
+	nl, nr, exactDI, found, _, _ := p.narrowWithNodes(seekKey, l, r)
 	if found {
 		if err := cur.Reset(exactDI, g); err != nil {
 			cur.Close()
@@ -473,8 +475,8 @@ func (p *PrefixIndex) Get(g *seg.Reader, key []byte) (v []byte, ok bool, offset 
 		return nil, false, 0, nil
 	}
 
-	// narrow with cached nodes
-	nl, nr, exactDI, found := p.narrowWithNodes(key, l, r)
+	// narrow with cached nodes (bounding node keys feed interpolation)
+	nl, nr, exactDI, found, klo, khi := p.narrowWithNodes(key, l, r)
 	if found {
 		_, v, offset, err = p.dataLookupFunc(exactDI, g)
 		if err != nil {
@@ -483,6 +485,35 @@ func (p *PrefixIndex) Get(g *seg.Reader, key []byte) (v []byte, ok bool, offset 
 		return v, true, offset, nil
 	}
 	l, r = nl, nr
+
+	// Hybrid: interpolation narrow in [l,r) using the cached-node bound keys —
+	// probes cluster near the target so cold .kv reads fault fewer distinct pages.
+	if BtInterp && len(klo) > 0 && len(khi) > 0 {
+		probes := uint64(0)
+		var kmArr, kloArr, khiArr [64]byte
+		km := kmArr[:0]
+		for l < r && r-l > DefaultBtreeStartSkip {
+			if probes >= BtInterpBudget {
+				break
+			}
+			mm := interpMid(key, klo, khi, l, r)
+			probes++
+			off := p.offt.Get(mm)
+			g.Reset(off)
+			km, _ = g.Next(km[:0])
+			c := bytes.Compare(key, km)
+			if c == 0 {
+				v, _ = g.Next(nil)
+				return v, true, off, nil
+			} else if c < 0 {
+				r = mm
+				khi = append(khiArr[:0], km...)
+			} else {
+				l = mm + 1
+				klo = append(kloArr[:0], km...)
+			}
+		}
+	}
 
 	// Disk binary search in [l, r)
 	var cmp int
