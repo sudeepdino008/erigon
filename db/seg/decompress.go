@@ -784,7 +784,12 @@ type Getter struct {
 	patternDict *patternTable
 	d           *Decompressor
 	fName       string
-	trace       bool
+	// scratch reused across Next() calls: the pattern layout recorded in pass 1
+	// (buffer offset + length per pattern) so pass 2 can fill uncovered gaps
+	// without re-decoding the Huffman streams.
+	patBufPos []int
+	patLens   []int
+	trace     bool
 }
 
 func (g *Getter) MadvNormal() MadvDisabler {
@@ -973,36 +978,37 @@ func (g *Getter) Next(buf []byte) ([]byte, uint64) {
 		buf = buf[:len(buf)+int(wordLen)]
 	}
 
-	// Loop below fills in the patterns
-	// Tracking position in buf where to insert part of the word
+	// Pass 1 fills in the patterns and records their layout (buffer offset +
+	// length) so pass 2 can fill the uncovered gaps without re-decoding the
+	// Huffman streams.
 	bufPos := bufOffset
+	patBufPos := g.patBufPos[:0]
+	patLens := g.patLens[:0]
 	for pos := g.nextPos(); pos != 0; pos = g.nextPos() {
 		bufPos += int(pos) - 1 // Positions where to insert patterns are encoded relative to one another
 		pt := g.nextPattern()
 		copy(buf[bufPos:], pt)
+		patBufPos = append(patBufPos, bufPos)
+		patLens = append(patLens, len(pt))
 	}
+	g.patBufPos = patBufPos
+	g.patLens = patLens
 	if g.dataBit > 0 {
 		g.dataP++
 		g.dataBit = 0
 	}
 	postLoopPos := g.dataP
-	g.dataP = savePos
-	g.dataBit = 0
-	g.nextPosClean() // Reset the state of huffman reader
 
-	// Restore to the beginning of buf
-	bufPos = bufOffset
+	// Pass 2 fills the data not covered by patterns, replaying the recorded
+	// layout instead of decoding the Huffman streams a second time.
 	lastUncovered := bufOffset
-
-	// Loop below fills the data which is not in the patterns
-	for pos := g.nextPos(); pos != 0; pos = g.nextPos() {
-		bufPos += int(pos) - 1 // Positions where to insert patterns are encoded relative to one another
-		if bufPos > lastUncovered {
-			dif := uint64(bufPos - lastUncovered)
-			copy(buf[lastUncovered:bufPos], g.data[postLoopPos:postLoopPos+dif])
+	for i, bp := range patBufPos {
+		if bp > lastUncovered {
+			dif := uint64(bp - lastUncovered)
+			copy(buf[lastUncovered:bp], g.data[postLoopPos:postLoopPos+dif])
 			postLoopPos += dif
 		}
-		lastUncovered = bufPos + len(g.nextPattern())
+		lastUncovered = bp + patLens[i]
 	}
 	if bufOffset+int(wordLen) > lastUncovered {
 		dif := uint64(bufOffset + int(wordLen) - lastUncovered)
