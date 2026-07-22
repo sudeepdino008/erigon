@@ -956,6 +956,51 @@ func (g *Getter) HasNext() bool {
 // After extracting next word, it moves to the beginning of the next one
 func (g *Getter) Next(buf []byte) ([]byte, uint64) {
 	savePos := g.dataP
+	if g.dataBit > 0 {
+		g.dataP++
+		g.dataBit = 0
+	}
+	// Fast path for the common byte-aligned word: the length code and the first
+	// position code together span at most 18 bits, so both are read from a
+	// single 8-byte load. Handles empty words and words with no patterns (whose
+	// entire content is a single raw run) without a second Huffman decode.
+	if g.posMask != 0 {
+		alignedStart := g.dataP
+		if alignedStart+8 <= g.dataLen {
+			v := binary.LittleEndian.Uint64(g.data[alignedStart : alignedStart+8])
+			e1 := g.posEntries[uint16(v)&g.posMask]
+			if e1.bits != 0 {
+				l1 := uint(e1.bits)
+				if e1.pos == 1 { // wordLen == 0: empty word, no position follows
+					total := l1
+					g.dataP = alignedStart + uint64((total+7)>>3)
+					g.dataBit = 0
+					if buf == nil {
+						buf = []byte{}
+					}
+					return buf, g.dataP
+				}
+				e2 := g.posEntries[uint16(v>>l1)&g.posMask]
+				if e2.bits != 0 && e2.pos == 0 { // no patterns: single raw run
+					wordLen := uint64(e1.pos) - 1
+					bufOffset := len(buf)
+					if len(buf)+int(wordLen) > cap(buf) {
+						newBuf := make([]byte, len(buf)+int(wordLen))
+						copy(newBuf, buf)
+						buf = newBuf
+					} else {
+						buf = buf[:len(buf)+int(wordLen)]
+					}
+					postLoopPos := alignedStart + uint64((l1+uint(e2.bits)+7)>>3)
+					copy(buf[bufOffset:bufOffset+int(wordLen)], g.data[postLoopPos:postLoopPos+wordLen])
+					g.dataP = postLoopPos + wordLen
+					g.dataBit = 0
+					return buf, g.dataP
+				}
+			}
+		}
+	}
+
 	wordLen := g.nextPosClean()
 	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
 	if wordLen == 0 {
