@@ -821,9 +821,14 @@ func (g *Getter) nextPos() uint64 {
 	dataP := g.dataP
 	dataBit := uint(g.dataBit) & 7 // & 7 proves to compiler: 0 ≤ dataBit < 8, eliminating shift guards
 	data := g.data
-	code := uint16(data[dataP]) >> dataBit
-	if dataP+1 < g.dataLen {
-		code |= uint16(data[dataP+1]) << (8 - dataBit)
+	var code uint16
+	if dataP+8 <= g.dataLen {
+		code = uint16(binary.LittleEndian.Uint64(data[dataP:dataP+8]) >> dataBit)
+	} else {
+		code = uint16(data[dataP]) >> dataBit
+		if dataP+1 < g.dataLen {
+			code |= uint16(data[dataP+1]) << (8 - dataBit)
+		}
 	}
 	code &= g.posMask
 	entry := g.posEntries[code]
