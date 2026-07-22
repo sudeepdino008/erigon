@@ -987,9 +987,22 @@ func (g *Getter) Next(buf []byte) ([]byte, uint64) {
 	// length) so pass 2 can fill the uncovered gaps without re-decoding the
 	// Huffman streams.
 	bufPos := bufOffset
+	pos := g.nextPos()
+	if pos == 0 {
+		// No patterns: the whole word is raw uncovered bytes, copied in one shot.
+		if g.dataBit > 0 {
+			g.dataP++
+			g.dataBit = 0
+		}
+		postLoopPos := g.dataP
+		copy(buf[bufOffset:bufOffset+int(wordLen)], g.data[postLoopPos:postLoopPos+wordLen])
+		g.dataP = postLoopPos + wordLen
+		g.dataBit = 0
+		return buf, g.dataP
+	}
 	patBufPos := g.patBufPos[:0]
 	patLens := g.patLens[:0]
-	for pos := g.nextPos(); pos != 0; pos = g.nextPos() {
+	for ; pos != 0; pos = g.nextPos() {
 		bufPos += int(pos) - 1 // Positions where to insert patterns are encoded relative to one another
 		pt := g.nextPattern()
 		copy(buf[bufPos:], pt)
