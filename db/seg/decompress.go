@@ -1083,24 +1083,63 @@ func (g *Getter) Next(buf []byte) ([]byte, uint64) {
 	return buf, postLoopPos
 }
 
-func (g *Getter) NextUncompressed() ([]byte, uint64) {
+// uncompressedRange decodes an uncompressed word at the current byte-aligned
+// offset and returns its [start, end) byte range within g.data, leaving g.dataP
+// at end (dataBit 0). An uncompressed word is a length code followed by the
+// terminator, then the raw bytes; both codes span at most 18 bits, so the common
+// path reads them from a single 8-byte load (mirrors Next's fused fast path).
+// For the empty word start == end.
+func (g *Getter) uncompressedRange() (start, end uint64) {
+	if g.dataBit > 0 {
+		g.dataP++
+		g.dataBit = 0
+	}
+	if g.posMask != 0 {
+		alignedStart := g.dataP
+		if alignedStart+8 <= g.dataLen {
+			v := binary.LittleEndian.Uint64(g.data[alignedStart : alignedStart+8])
+			e1 := g.posEntries[uint16(v)&g.posMask]
+			if e1.bits != 0 {
+				wordLen := uint64(e1.pos) - 1
+				if wordLen == 0 {
+					p := alignedStart + uint64((uint(e1.bits)+7)>>3)
+					g.dataP = p
+					return p, p
+				}
+				e2 := g.posEntries[uint16(v>>uint(e1.bits))&g.posMask]
+				if e2.bits != 0 {
+					start = alignedStart + uint64((uint(e1.bits)+uint(e2.bits)+7)>>3)
+					end = start + wordLen
+					g.dataP = end
+					return start, end
+				}
+			}
+		}
+	}
+	// Fallback: near EOF, subtable-coded length/terminator, or single-position table.
 	wordLen := g.nextPosClean()
-	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
+	wordLen--
 	if wordLen == 0 {
 		if g.dataBit > 0 {
 			g.dataP++
 			g.dataBit = 0
 		}
-		return g.data[g.dataP:g.dataP], g.dataP
+		return g.dataP, g.dataP
 	}
 	g.nextPos()
 	if g.dataBit > 0 {
 		g.dataP++
 		g.dataBit = 0
 	}
-	pos := g.dataP
-	g.dataP += wordLen
-	return g.data[pos:g.dataP], g.dataP
+	start = g.dataP
+	end = start + wordLen
+	g.dataP = end
+	return start, end
+}
+
+func (g *Getter) NextUncompressed() ([]byte, uint64) {
+	start, end := g.uncompressedRange()
+	return g.data[start:end], end
 }
 
 // Skip moves offset to the next word and returns the new offset and the length of the word.
@@ -1142,22 +1181,8 @@ func (g *Getter) Skip() (uint64, int) {
 }
 
 func (g *Getter) SkipUncompressed() (uint64, int) {
-	wordLen := g.nextPosClean()
-	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
-	if wordLen == 0 {
-		if g.dataBit > 0 {
-			g.dataP++
-			g.dataBit = 0
-		}
-		return g.dataP, 0
-	}
-	g.nextPos()
-	if g.dataBit > 0 {
-		g.dataP++
-		g.dataBit = 0
-	}
-	g.dataP += wordLen
-	return g.dataP, int(wordLen)
+	start, end := g.uncompressedRange()
+	return end, int(end - start)
 }
 
 // MatchPrefix only checks if the word at the current offset has a buf prefix. Does not move offset to the next word.
@@ -1365,8 +1390,8 @@ func (g *Getter) MatchPrefixUncompressed(prefix []byte) bool {
 		g.dataP, g.dataBit = savePos, 0
 	}()
 
-	wordLen := g.nextPosClean()
-	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
+	start, end := g.uncompressedRange()
+	wordLen := end - start
 	prefixLen := len(prefix)
 	if wordLen == 0 {
 		return prefixLen == 0 // empty word only matches empty prefix
@@ -1374,49 +1399,29 @@ func (g *Getter) MatchPrefixUncompressed(prefix []byte) bool {
 	if prefixLen == 0 {
 		return true // empty prefix matches any word
 	}
-
-	g.nextPos()
-	if g.dataBit > 0 {
-		g.dataP++
-		g.dataBit = 0
-	}
-
-	return bytes.HasPrefix(g.data[g.dataP:g.dataP+wordLen], prefix)
+	return bytes.HasPrefix(g.data[start:end], prefix)
 }
 
 func (g *Getter) MatchCmpUncompressed(buf []byte) int {
 	savePos := g.dataP
-	wordLen := g.nextPosClean()
-	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
-	bufLen := len(buf)
-	if wordLen == 0 && bufLen != 0 {
+	start, end := g.uncompressedRange()
+	wordLen := end - start
+	bufLen := uint64(len(buf))
+	if wordLen == 0 {
+		if bufLen == 0 {
+			return 0 // both empty — consume the word (g.dataP already at end)
+		}
 		g.dataP, g.dataBit = savePos, 0
 		return 1
-	}
-	if wordLen == 0 && bufLen == 0 {
-		if g.dataBit > 0 {
-			g.dataP++
-			g.dataBit = 0
-		}
-		return 0
 	}
 	if bufLen == 0 {
 		g.dataP, g.dataBit = savePos, 0
 		return -1
 	}
 
-	g.nextPos()
-	if g.dataBit > 0 {
-		g.dataP++
-		g.dataBit = 0
-	}
-
-	cmp := bytes.Compare(buf, g.data[g.dataP:g.dataP+wordLen])
-	if cmp == 0 {
-		g.dataP += wordLen // advance past the word on match
-		g.dataBit = 0
-	} else {
-		g.dataP, g.dataBit = savePos, 0
+	cmp := bytes.Compare(buf, g.data[start:end])
+	if cmp != 0 {
+		g.dataP, g.dataBit = savePos, 0 // mismatch — restore; match leaves g.dataP at end
 	}
 	return cmp
 }

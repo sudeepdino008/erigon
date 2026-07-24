@@ -112,3 +112,63 @@ func BenchmarkCommitmentDecompress(b *testing.B) {
 		b.SetBytes(totalBytes / int64(b.N))
 	})
 }
+
+// BenchmarkCommitmentUncompressed measures the uncompressed read paths that
+// production actually uses for commitment/accounts/storage values (CompressKeys
+// / CompressNone domains store values via the uncompressed word encoding).
+func BenchmarkCommitmentUncompressed(b *testing.B) {
+	path := commitmentKVPath(b)
+	d, err := NewDecompressor(path)
+	require.NoError(b, err)
+	defer d.Close()
+	d.MadvWillNeed()
+
+	g := d.MakeGetter()
+	offsets := collectValueOffsets(b, d)
+	require.NotEmpty(b, offsets)
+	words := make([][]byte, len(offsets))
+	for i, off := range offsets {
+		g.Reset(off)
+		w, _ := g.NextUncompressed()
+		words[i] = append([]byte(nil), w...)
+	}
+
+	b.Run("NextUncompressed", func(b *testing.B) {
+		b.ReportAllocs()
+		i := 0
+		for b.Loop() {
+			g.Reset(offsets[i])
+			g.NextUncompressed()
+			i++
+			if i == len(offsets) {
+				i = 0
+			}
+		}
+	})
+
+	b.Run("SkipUncompressed", func(b *testing.B) {
+		b.ReportAllocs()
+		i := 0
+		for b.Loop() {
+			g.Reset(offsets[i])
+			g.SkipUncompressed()
+			i++
+			if i == len(offsets) {
+				i = 0
+			}
+		}
+	})
+
+	b.Run("MatchCmpUncompressed_hit", func(b *testing.B) {
+		b.ReportAllocs()
+		i := 0
+		for b.Loop() {
+			g.Reset(offsets[i])
+			g.MatchCmpUncompressed(words[i])
+			i++
+			if i == len(offsets) {
+				i = 0
+			}
+		}
+	})
+}
