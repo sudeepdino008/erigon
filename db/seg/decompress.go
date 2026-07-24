@@ -784,7 +784,12 @@ type Getter struct {
 	patternDict *patternTable
 	d           *Decompressor
 	fName       string
-	trace       bool
+	// scratch reused across Next() calls: the pattern layout recorded in pass 1
+	// (buffer offset + length per pattern) so pass 2 can fill uncovered gaps
+	// without re-decoding the Huffman streams.
+	patBufPos []int
+	patLens   []int
+	trace     bool
 }
 
 func (g *Getter) MadvNormal() MadvDisabler {
@@ -816,9 +821,14 @@ func (g *Getter) nextPos() uint64 {
 	dataP := g.dataP
 	dataBit := uint(g.dataBit) & 7 // & 7 proves to compiler: 0 ≤ dataBit < 8, eliminating shift guards
 	data := g.data
-	code := uint16(data[dataP]) >> dataBit
-	if dataP+1 < g.dataLen {
-		code |= uint16(data[dataP+1]) << (8 - dataBit)
+	var code uint16
+	if dataP+8 <= g.dataLen {
+		code = uint16(binary.LittleEndian.Uint64(data[dataP:dataP+8]) >> dataBit)
+	} else {
+		code = uint16(data[dataP]) >> dataBit
+		if dataP+1 < g.dataLen {
+			code |= uint16(data[dataP+1]) << (8 - dataBit)
+		}
 	}
 	code &= g.posMask
 	entry := g.posEntries[code]
@@ -946,6 +956,51 @@ func (g *Getter) HasNext() bool {
 // After extracting next word, it moves to the beginning of the next one
 func (g *Getter) Next(buf []byte) ([]byte, uint64) {
 	savePos := g.dataP
+	if g.dataBit > 0 {
+		g.dataP++
+		g.dataBit = 0
+	}
+	// Fast path for the common byte-aligned word: the length code and the first
+	// position code together span at most 18 bits, so both are read from a
+	// single 8-byte load. Handles empty words and words with no patterns (whose
+	// entire content is a single raw run) without a second Huffman decode.
+	if g.posMask != 0 {
+		alignedStart := g.dataP
+		if alignedStart+8 <= g.dataLen {
+			v := binary.LittleEndian.Uint64(g.data[alignedStart : alignedStart+8])
+			e1 := g.posEntries[uint16(v)&g.posMask]
+			if e1.bits != 0 {
+				l1 := uint(e1.bits)
+				if e1.pos == 1 { // wordLen == 0: empty word, no position follows
+					total := l1
+					g.dataP = alignedStart + uint64((total+7)>>3)
+					g.dataBit = 0
+					if buf == nil {
+						buf = []byte{}
+					}
+					return buf, g.dataP
+				}
+				e2 := g.posEntries[uint16(v>>l1)&g.posMask]
+				if e2.bits != 0 && e2.pos == 0 { // no patterns: single raw run
+					wordLen := uint64(e1.pos) - 1
+					bufOffset := len(buf)
+					if len(buf)+int(wordLen) > cap(buf) {
+						newBuf := make([]byte, len(buf)+int(wordLen))
+						copy(newBuf, buf)
+						buf = newBuf
+					} else {
+						buf = buf[:len(buf)+int(wordLen)]
+					}
+					postLoopPos := alignedStart + uint64((l1+uint(e2.bits)+7)>>3)
+					copy(buf[bufOffset:bufOffset+int(wordLen)], g.data[postLoopPos:postLoopPos+wordLen])
+					g.dataP = postLoopPos + wordLen
+					g.dataBit = 0
+					return buf, g.dataP
+				}
+			}
+		}
+	}
+
 	wordLen := g.nextPosClean()
 	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
 	if wordLen == 0 {
@@ -973,36 +1028,50 @@ func (g *Getter) Next(buf []byte) ([]byte, uint64) {
 		buf = buf[:len(buf)+int(wordLen)]
 	}
 
-	// Loop below fills in the patterns
-	// Tracking position in buf where to insert part of the word
+	// Pass 1 fills in the patterns and records their layout (buffer offset +
+	// length) so pass 2 can fill the uncovered gaps without re-decoding the
+	// Huffman streams.
 	bufPos := bufOffset
-	for pos := g.nextPos(); pos != 0; pos = g.nextPos() {
+	pos := g.nextPos()
+	if pos == 0 {
+		// No patterns: the whole word is raw uncovered bytes, copied in one shot.
+		if g.dataBit > 0 {
+			g.dataP++
+			g.dataBit = 0
+		}
+		postLoopPos := g.dataP
+		copy(buf[bufOffset:bufOffset+int(wordLen)], g.data[postLoopPos:postLoopPos+wordLen])
+		g.dataP = postLoopPos + wordLen
+		g.dataBit = 0
+		return buf, g.dataP
+	}
+	patBufPos := g.patBufPos[:0]
+	patLens := g.patLens[:0]
+	for ; pos != 0; pos = g.nextPos() {
 		bufPos += int(pos) - 1 // Positions where to insert patterns are encoded relative to one another
 		pt := g.nextPattern()
 		copy(buf[bufPos:], pt)
+		patBufPos = append(patBufPos, bufPos)
+		patLens = append(patLens, len(pt))
 	}
+	g.patBufPos = patBufPos
+	g.patLens = patLens
 	if g.dataBit > 0 {
 		g.dataP++
 		g.dataBit = 0
 	}
 	postLoopPos := g.dataP
-	g.dataP = savePos
-	g.dataBit = 0
-	g.nextPosClean() // Reset the state of huffman reader
 
-	// Restore to the beginning of buf
-	bufPos = bufOffset
+	// Pass 2 fills the data not covered by patterns, replaying the recorded
+	// layout instead of decoding the Huffman streams a second time.
 	lastUncovered := bufOffset
-
-	// Loop below fills the data which is not in the patterns
-	for pos := g.nextPos(); pos != 0; pos = g.nextPos() {
-		bufPos += int(pos) - 1 // Positions where to insert patterns are encoded relative to one another
-		if bufPos > lastUncovered {
-			dif := uint64(bufPos - lastUncovered)
-			copy(buf[lastUncovered:bufPos], g.data[postLoopPos:postLoopPos+dif])
+	for i, bp := range patBufPos {
+		if bp > lastUncovered {
+			dif := uint64(bp - lastUncovered)
+			copy(buf[lastUncovered:bp], g.data[postLoopPos:postLoopPos+dif])
 			postLoopPos += dif
 		}
-		lastUncovered = bufPos + len(g.nextPattern())
+		lastUncovered = bp + patLens[i]
 	}
 	if bufOffset+int(wordLen) > lastUncovered {
 		dif := uint64(bufOffset + int(wordLen) - lastUncovered)
@@ -1014,24 +1083,63 @@ func (g *Getter) Next(buf []byte) ([]byte, uint64) {
 	return buf, postLoopPos
 }
 
-func (g *Getter) NextUncompressed() ([]byte, uint64) {
+// uncompressedRange decodes an uncompressed word at the current byte-aligned
+// offset and returns its [start, end) byte range within g.data, leaving g.dataP
+// at end (dataBit 0). An uncompressed word is a length code followed by the
+// terminator, then the raw bytes; both codes span at most 18 bits, so the common
+// path reads them from a single 8-byte load (mirrors Next's fused fast path).
+// For the empty word start == end.
+func (g *Getter) uncompressedRange() (start, end uint64) {
+	if g.dataBit > 0 {
+		g.dataP++
+		g.dataBit = 0
+	}
+	if g.posMask != 0 {
+		alignedStart := g.dataP
+		if alignedStart+8 <= g.dataLen {
+			v := binary.LittleEndian.Uint64(g.data[alignedStart : alignedStart+8])
+			e1 := g.posEntries[uint16(v)&g.posMask]
+			if e1.bits != 0 {
+				wordLen := uint64(e1.pos) - 1
+				if wordLen == 0 {
+					p := alignedStart + uint64((uint(e1.bits)+7)>>3)
+					g.dataP = p
+					return p, p
+				}
+				e2 := g.posEntries[uint16(v>>uint(e1.bits))&g.posMask]
+				if e2.bits != 0 {
+					start = alignedStart + uint64((uint(e1.bits)+uint(e2.bits)+7)>>3)
+					end = start + wordLen
+					g.dataP = end
+					return start, end
+				}
+			}
+		}
+	}
+	// Fallback: near EOF, subtable-coded length/terminator, or single-position table.
 	wordLen := g.nextPosClean()
-	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
+	wordLen--
 	if wordLen == 0 {
 		if g.dataBit > 0 {
 			g.dataP++
 			g.dataBit = 0
 		}
-		return g.data[g.dataP:g.dataP], g.dataP
+		return g.dataP, g.dataP
 	}
 	g.nextPos()
 	if g.dataBit > 0 {
 		g.dataP++
 		g.dataBit = 0
 	}
-	pos := g.dataP
-	g.dataP += wordLen
-	return g.data[pos:g.dataP], g.dataP
+	start = g.dataP
+	end = start + wordLen
+	g.dataP = end
+	return start, end
+}
+
+func (g *Getter) NextUncompressed() ([]byte, uint64) {
+	start, end := g.uncompressedRange()
+	return g.data[start:end], end
 }
 
 // Skip moves offset to the next word and returns the new offset and the length of the word.
@@ -1073,22 +1181,8 @@ func (g *Getter) Skip() (uint64, int) {
 }
 
 func (g *Getter) SkipUncompressed() (uint64, int) {
-	wordLen := g.nextPosClean()
-	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
-	if wordLen == 0 {
-		if g.dataBit > 0 {
-			g.dataP++
-			g.dataBit = 0
-		}
-		return g.dataP, 0
-	}
-	g.nextPos()
-	if g.dataBit > 0 {
-		g.dataP++
-		g.dataBit = 0
-	}
-	g.dataP += wordLen
-	return g.dataP, int(wordLen)
+	start, end := g.uncompressedRange()
+	return end, int(end - start)
 }
 
 // MatchPrefix only checks if the word at the current offset has a buf prefix. Does not move offset to the next word.
@@ -1296,8 +1390,8 @@ func (g *Getter) MatchPrefixUncompressed(prefix []byte) bool {
 		g.dataP, g.dataBit = savePos, 0
 	}()
 
-	wordLen := g.nextPosClean()
-	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
+	start, end := g.uncompressedRange()
+	wordLen := end - start
 	prefixLen := len(prefix)
 	if wordLen == 0 {
 		return prefixLen == 0 // empty word only matches empty prefix
@@ -1305,49 +1399,29 @@ func (g *Getter) MatchPrefixUncompressed(prefix []byte) bool {
 	if prefixLen == 0 {
 		return true // empty prefix matches any word
 	}
-
-	g.nextPos()
-	if g.dataBit > 0 {
-		g.dataP++
-		g.dataBit = 0
-	}
-
-	return bytes.HasPrefix(g.data[g.dataP:g.dataP+wordLen], prefix)
+	return bytes.HasPrefix(g.data[start:end], prefix)
 }
 
 func (g *Getter) MatchCmpUncompressed(buf []byte) int {
 	savePos := g.dataP
-	wordLen := g.nextPosClean()
-	wordLen-- // because when create huffman tree we do ++ , because 0 is terminator
-	bufLen := len(buf)
-	if wordLen == 0 && bufLen != 0 {
+	start, end := g.uncompressedRange()
+	wordLen := end - start
+	bufLen := uint64(len(buf))
+	if wordLen == 0 {
+		if bufLen == 0 {
+			return 0 // both empty — consume the word (g.dataP already at end)
+		}
 		g.dataP, g.dataBit = savePos, 0
 		return 1
-	}
-	if wordLen == 0 && bufLen == 0 {
-		if g.dataBit > 0 {
-			g.dataP++
-			g.dataBit = 0
-		}
-		return 0
 	}
 	if bufLen == 0 {
 		g.dataP, g.dataBit = savePos, 0
 		return -1
 	}
 
-	g.nextPos()
-	if g.dataBit > 0 {
-		g.dataP++
-		g.dataBit = 0
-	}
-
-	cmp := bytes.Compare(buf, g.data[g.dataP:g.dataP+wordLen])
-	if cmp == 0 {
-		g.dataP += wordLen // advance past the word on match
-		g.dataBit = 0
-	} else {
-		g.dataP, g.dataBit = savePos, 0
+	cmp := bytes.Compare(buf, g.data[start:end])
+	if cmp != 0 {
+		g.dataP, g.dataBit = savePos, 0 // mismatch — restore; match leaves g.dataP at end
 	}
 	return cmp
 }
