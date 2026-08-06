@@ -24,10 +24,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -763,6 +765,80 @@ func TestSortableBufferStableSort(t *testing.T) {
 	require.Equal(t, dupsPerKey, seq, "expected %d duplicate entries", dupsPerKey)
 }
 
+func TestSortableBufferRadixMatchesReference(t *testing.T) {
+	rnd := mrand.New(mrand.NewSource(1))
+	type kv struct {
+		k, v []byte
+		ord  int
+	}
+	for _, n := range []int{0, 1, 2, 31, 33, 1000, 5000} {
+		for _, maxKeyLen := range []int{1, 5, 8, 12, 40} {
+			for _, distinct := range []int{2, 50, n + 1} {
+				buf := NewSortableBuffer(256 * 1024 * 1024)
+				ref := make([]kv, 0, n)
+				for i := range n {
+					var k []byte
+					if distinct > 0 {
+						kl := 1 + rnd.Intn(maxKeyLen)
+						k = make([]byte, kl)
+						sel := rnd.Intn(distinct)
+						for b := range k {
+							k[b] = byte((sel >> (uint(b) * 3)) ^ (b * 17))
+						}
+					}
+					v := make([]byte, 8)
+					binary.BigEndian.PutUint64(v, uint64(i))
+					buf.Put(k, v)
+					ref = append(ref, kv{k: k, v: v, ord: i})
+				}
+				sort.SliceStable(ref, func(a, b int) bool {
+					return bytes.Compare(ref[a].k, ref[b].k) < 0
+				})
+				buf.Sort()
+				require.Equal(t, n, buf.Len())
+				for i := range buf.Len() {
+					k, v := buf.Get(i)
+					require.Equalf(t, ref[i].k, k, "n=%d maxKeyLen=%d distinct=%d pos=%d key", n, maxKeyLen, distinct, i)
+					require.Equalf(t, ref[i].v, v, "n=%d maxKeyLen=%d distinct=%d pos=%d val(order)", n, maxKeyLen, distinct, i)
+				}
+			}
+		}
+	}
+}
+
+// TestSortableBufferRadixParallel exercises the concurrent top-level radix path
+// (n above parallelRadixMin) for both well-distributed and clustered keys.
+func TestSortableBufferRadixParallel(t *testing.T) {
+	rnd := mrand.New(mrand.NewSource(7))
+	const n = 200_000 // > parallelRadixMin
+	type kv struct{ k, v []byte }
+	for _, clustered := range []bool{false, true} {
+		buf := NewSortableBuffer(256 * 1024 * 1024)
+		ref := make([]kv, 0, n)
+		for i := range n {
+			k := make([]byte, 32)
+			if clustered {
+				binary.BigEndian.PutUint64(k, (uint64(rnd.Intn(1500)))*0x9e3779b97f4a7c15)
+				binary.BigEndian.PutUint64(k[16:], uint64(i))
+			} else {
+				rnd.Read(k)
+			}
+			v := make([]byte, 8)
+			binary.BigEndian.PutUint64(v, uint64(i))
+			buf.Put(k, v)
+			ref = append(ref, kv{k: k, v: v})
+		}
+		sort.SliceStable(ref, func(a, b int) bool { return bytes.Compare(ref[a].k, ref[b].k) < 0 })
+		buf.Sort()
+		require.Equal(t, n, buf.Len())
+		for i := range buf.Len() {
+			k, v := buf.Get(i)
+			require.Equalf(t, ref[i].k, k, "clustered=%v pos=%d key", clustered, i)
+			require.Equalf(t, ref[i].v, v, "clustered=%v pos=%d val(order)", clustered, i)
+		}
+	}
+}
+
 func TestSortableBufferNilAndEmptyKeys(t *testing.T) {
 	buf := NewSortableBuffer(256 * 1024)
 
@@ -1188,11 +1264,16 @@ func BenchmarkSortableBufferPutSortLoad(b *testing.B) {
 		name   string
 		count  int
 		sorted bool
+		// clustered mimics storage keys: few distinct high-8-byte prefixes (here ~count/100
+		// accounts), many keys each, arriving in pseudo-random order — stresses prefix collisions.
+		clustered bool
 	}{
-		{"random_100k", 100_000, false},
-		{"random_500k", 500_000, false},
-		{"sorted_100k", 100_000, true},
-		{"sorted_500k", 500_000, true},
+		{"random_100k", 100_000, false, false},
+		{"random_500k", 500_000, false, false},
+		{"sorted_100k", 100_000, true, false},
+		{"sorted_500k", 500_000, true, false},
+		{"clustered_100k", 100_000, false, true},
+		{"clustered_500k", 500_000, false, true},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -1200,12 +1281,19 @@ func BenchmarkSortableBufferPutSortLoad(b *testing.B) {
 			val := make([]byte, valLen)
 			buf := NewSortableBuffer(256 * 1024 * 1024)
 			buf.Prealloc(tc.count, tc.count*(keyLen+valLen))
+			nAccounts := uint64(tc.count/100 + 1)
 			for b.Loop() {
 				buf.Reset()
 				for i := range tc.count {
-					if tc.sorted {
+					switch {
+					case tc.sorted:
 						binary.BigEndian.PutUint64(key, uint64(i))
-					} else {
+					case tc.clustered:
+						acct := ((uint64(i) * 6364136223846793005) % nAccounts) * 0x9e3779b97f4a7c15
+						binary.BigEndian.PutUint64(key, acct)
+						binary.BigEndian.PutUint64(key[8:], uint64(i)*0xdeadbeefdeadbeef)
+						binary.BigEndian.PutUint64(key[16:], uint64(i))
+					default:
 						x := uint64(i) * 6364136223846793005
 						binary.BigEndian.PutUint64(key, x)
 						binary.BigEndian.PutUint64(key[8:], x^0xdeadbeef)
